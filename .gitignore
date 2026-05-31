@@ -1,0 +1,22 @@
+# 编译输出
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+Makefile
+*-log.txt
+*.o
+*.obj
+*.exe
+
+# IDE 配置
+.vscode/
+.codex
+.serena/
+
+# benchmark 输出
+example/benchmark/muduoprovider*.txt
+example/benchmark/uringprovider*.txt
+bin/*-log.txt
+
+
