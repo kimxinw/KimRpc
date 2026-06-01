@@ -1,5 +1,6 @@
 #include "connectionmanager.h"
 
+
 ConnectionContext *ConnectionManager::acquire(int fd)
 {
     ConnectionContext *ctx;
@@ -16,6 +17,7 @@ ConnectionContext *ConnectionManager::acquire(int fd)
         ctx->reset(fd);
         m_allConns.push_back(std::move(newCtx));
     }
+    ctx->connId = nextId.fetch_add(1, std::memory_order_relaxed);
     m_active[fd] = ctx;
     return ctx;
 }

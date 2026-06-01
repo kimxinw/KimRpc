@@ -27,11 +27,22 @@ bool setNonBlock(int fd)
     }
     return fcntl(fd, F_SETFL, flags | O_NONBLOCK) != -1;
 }
+
+bool setTcpNoDelay(int fd, bool on)
+{
+    int opt = on ? 1 : 0;
+    return setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt)) != -1;
+}
 }
 
 namespace {
 constexpr int kEventShift = 48;
 constexpr uintptr_t kPtrMask = (1ULL << kEventShift) - 1;
+
+// 协议/背压上限：防止恶意或异常 peer 触发巨量分配、压垮线程池与发送队列
+constexpr uint32_t kMaxHeaderSize = 64 * 1024;          // RpcHeader 最大 64KB
+constexpr uint32_t kMaxBodySize = 64u * 1024 * 1024;    // args 最大 64MB
+constexpr int kMaxInflightPerConn = 256;                // 单连接最大在途请求数
 }
 
 __u64 UringRpcProvider::packUserData(ConnectionContext* ctx, OpType op) {
@@ -297,7 +308,7 @@ bool UringRpcProvider::submitRecv(int fd)
 }
 
 // 为队首响应启动/继续一次 send；队列空则将 sending 置 false。SQ 满返回 false
-bool UringRpcProvider::submitSend(int fd)
+bool UringRpcProvider:: submitSend(int fd)
 {
     ConnectionContext *ctx = m_connMgr.find(fd);
     if (ctx == nullptr) return false;
@@ -347,7 +358,8 @@ void UringRpcProvider::handleNotify()
     for (auto &r : responses)
     {
         ConnectionContext * ctx = m_connMgr.find(r.fd);
-        if (ctx == nullptr)
+        // fd 已被新连接复用：connId 对不上，丢弃这条属于旧连接的响应
+        if (ctx == nullptr || ctx->connId != r.connId)
         {
             continue;
         }
@@ -405,6 +417,10 @@ void UringRpcProvider::handleAccept(int result)
     }
 
     int connfd = result;
+    if (!setTcpNoDelay(connfd, true))
+    {
+        LOG_ERROR("set TCP_NODELAY error on fd=%d:%s", connfd, strerror(errno));
+    }
     setNonBlock(connfd);
     m_connMgr.acquire(connfd);
 
@@ -445,6 +461,14 @@ void UringRpcProvider::handleRecv(ConnectionContext *ctx, int result)
         }
     }
 
+    // 背压：在途请求达到上限时暂停 recv，不再从该连接读入更多请求，
+    // 让 TCP 接收窗口自然回压客户端；待响应发完后在 handleSend 里恢复
+    if (ctx->pendingReqs >= kMaxInflightPerConn)
+    {
+        ctx->readPaused = true;
+        return;
+    }
+
     // recv 与 send 解耦：排空后立即重新挂 recv，不再等响应发完
     if (!submitRecv(fd))
     {
@@ -472,6 +496,19 @@ void UringRpcProvider::handleSend(ConnectionContext *ctx, int result)
     {
         ctx->outQueue.pop_front();
         ctx->written = 0;
+        --ctx->pendingReqs;  // 一条请求的响应彻底发完，退出在途计数
+
+        // 背压解除：若此前因在途上限暂停了 recv，现在降到阈值下则恢复读
+        if (ctx->readPaused && ctx->pendingReqs < kMaxInflightPerConn)
+        {
+            ctx->readPaused = false;
+            if (!submitRecv(fd))
+            {
+                LOG_ERROR("SQ full, cannot resume recv on fd=%d, closing", fd);
+                m_connMgr.close(fd);
+                return;  // ctx 可能已回收，勿再续发
+            }
+        }
     }
 
     if (ctx->outQueue.empty())
@@ -497,6 +534,15 @@ bool UringRpcProvider::tryHandleRequest(int fd, ConnectionContext *ctx)
     uint32_t header_size = 0;
     ctx->input.copy((char *)&header_size, sizeof(uint32_t), 0);
 
+    // 先校验长度上限，再决定是否继续攒数据：否则恶意的超大 header_size
+    // 会让 input 无上限增长（永远等不齐）
+    if (header_size > kMaxHeaderSize)
+    {
+        LOG_ERROR("header_size %u exceeds limit on fd=%d, closing", header_size, fd);
+        m_connMgr.close(fd);
+        return true;
+    }
+
     if (ctx->input.size() < sizeof(uint32_t) + header_size)
     {
         return false;
@@ -515,6 +561,14 @@ bool UringRpcProvider::tryHandleRequest(int fd, ConnectionContext *ctx)
     std::string method_name = rpcHeader.method_name();
     uint32_t args_size = rpcHeader.args_size();
     uint64_t request_id = rpcHeader.request_id();
+
+    if (args_size > kMaxBodySize)
+    {
+        LOG_ERROR("args_size %u exceeds limit on fd=%d, closing", args_size, fd);
+        m_connMgr.close(fd);
+        return true;
+    }
+
     size_t request_size = sizeof(uint32_t) + header_size + args_size;
 
     if (ctx->input.size() < request_size)
@@ -564,7 +618,7 @@ bool UringRpcProvider::tryHandleRequest(int fd, ConnectionContext *ctx)
     }
     google::protobuf::Message *response = service->GetResponsePrototype(method).New();
 
-    ResponseTag *tag = new ResponseTag{fd, request_id};
+    ResponseTag *tag = new ResponseTag{fd, request_id, ctx->connId};
     google::protobuf::Closure *done = google::protobuf::NewCallback<UringRpcProvider,
                                                                      ResponseTag *,
                                                                      google::protobuf::Message *>(this,
@@ -572,6 +626,7 @@ bool UringRpcProvider::tryHandleRequest(int fd, ConnectionContext *ctx)
                                                                                                   tag,
                                                                                                   response);
 
+    ++ctx->pendingReqs;  // 派发即计入在途，响应发完后在 handleSend 里递减
     submitTask([service, method, request, response, done]() {
         service->CallMethod(method, nullptr, request, response, done);
         delete request;
@@ -583,6 +638,7 @@ bool UringRpcProvider::tryHandleRequest(int fd, ConnectionContext *ctx)
 void UringRpcProvider::sendRpcResponse(ResponseTag *tag, google::protobuf::Message *response)
 {
     int fd = tag->fd;
+    uint64_t connId = tag->connId;
     uint64_t request_id = tag->request_id;
     delete tag;
 
@@ -599,7 +655,7 @@ void UringRpcProvider::sendRpcResponse(ResponseTag *tag, google::protobuf::Messa
 
         {
             std::lock_guard<std::mutex> lock(m_pendingMutex);
-            m_pendingResponses.push_back({fd, std::move(data)});
+            m_pendingResponses.push_back({fd, connId, std::move(data)});
         }
         uint64_t val = 1;
         ::write(m_notifyFd, &val, sizeof(val));

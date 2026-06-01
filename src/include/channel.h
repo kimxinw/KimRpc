@@ -56,4 +56,5 @@ private:
     std::mutex m_pendingMtx;
     std::unordered_map<uint64_t, Pending *> m_pending;
     std::atomic<uint64_t> m_nextId;
+
 };

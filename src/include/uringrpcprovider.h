@@ -20,6 +20,7 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
+#include <netinet/tcp.h>
 
 
 class UringRpcProvider
@@ -54,6 +55,7 @@ private:
     struct PendingResponse
     {
         int fd;
+        uint64_t connId;
         std::string data; // size-prefixed wire bytes
     };
 
@@ -62,6 +64,7 @@ private:
     {
         int fd;
         uint64_t request_id;
+        uint64_t connId;
     };
 
     void startListen(const std::string &ip, uint16_t port);
@@ -85,7 +88,7 @@ private:
     void submitTask(std::function<void()> task);
     void workerThread();
 
-    void recycleConn(ConnectionContext* ctx);
+    // void recycleConn(ConnectionContext* ctx);
 
     // IO
     int m_listenfd;

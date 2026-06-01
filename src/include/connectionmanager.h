@@ -5,11 +5,13 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
-#include <unistd.h>
+#include <unistd.h>  // ::close
+#include <atomic>
 
 struct ConnectionContext
 {
     int fd;
+    uint64_t connId; // 单调递增的连接代号，跨线程回包时校验 fd 是否已被复用
     std::string input;
     std::deque<std::string> outQueue; // 待发送响应队列（多路复用：同一连接多个响应排队）
     size_t written;                   // 队首响应已发送的字节数
@@ -18,6 +20,9 @@ struct ConnectionContext
 
     int inflight;
     bool closing;
+
+    int pendingReqs;  // 已派发给业务线程、响应尚未发完的请求数（背压计数）
+    bool readPaused;  // 因背压暂停了 recv（达到 in-flight 上限），待响应发完后恢复
 
     void reset(int newfd)
     {
@@ -28,6 +33,8 @@ struct ConnectionContext
         sending = false;
         inflight = 0;
         closing = false;
+        pendingReqs = 0;
+        readPaused = false;
     }
 };
 
@@ -55,6 +62,7 @@ public:
     // 请求关闭连接（关 fd、移出活跃表、标记 closing）
     // 若无在途操作则立即回收，否则等最后一个 cqe
     void close(int fd);
+    
 
 private:
     void recycle(ConnectionContext *ctx);
@@ -63,4 +71,5 @@ private:
     std::vector<std::unique_ptr<ConnectionContext>> m_allConns;  // 所有权
     std::vector<ConnectionContext *> m_idlePool;                 // 空闲池
     size_t m_idlePoolSize = 100;
+    std::atomic<uint64_t> nextId{1};  // 0 留作无效 connId 哨兵
 };
