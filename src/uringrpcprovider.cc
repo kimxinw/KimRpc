@@ -8,7 +8,9 @@
 #include <arpa/inet.h>
 #include <cerrno>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <netinet/tcp.h>
 #include <fcntl.h>
 #include <iostream>
 #include <netinet/in.h>
@@ -39,10 +41,16 @@ namespace {
 constexpr int kEventShift = 48;
 constexpr uintptr_t kPtrMask = (1ULL << kEventShift) - 1;
 
-// 协议/背压上限：防止恶意或异常 peer 触发巨量分配、压垮线程池与发送队列
+// 协议/背压上限：防止恶意或异常 peer 触发巨量分配、压垮线 程池与发送队列
 constexpr uint32_t kMaxHeaderSize = 64 * 1024;          // RpcHeader 最大 64KB
 constexpr uint32_t kMaxBodySize = 64u * 1024 * 1024;    // args 最大 64MB
 constexpr int kMaxInflightPerConn = 256;                // 单连接最大在途请求数
+
+// provided buffer ring：所有连接共享一池内核可选缓冲，
+// recv 不再各自带 4KB buffer，空闲连接零缓冲占用
+constexpr unsigned kBufRingEntries = 1024;  // 必须是 2 的幂
+constexpr unsigned kBufSize = 4096;         // 单个 buffer 大小
+constexpr int kBufGroupId = 1;              // buffer group 标识
 }
 
 __u64 UringRpcProvider::packUserData(ConnectionContext* ctx, OpType op) {
@@ -102,6 +110,17 @@ UringRpcProvider::~UringRpcProvider()
         m_listenfd = -1;
     }
 
+    if (m_bufRing != nullptr)
+    {
+        io_uring_free_buf_ring(&m_ring, m_bufRing, kBufRingEntries, kBufGroupId);
+        m_bufRing = nullptr;
+    }
+    if (m_bufBase != nullptr)
+    {
+        free(m_bufBase);
+        m_bufBase = nullptr;
+    }
+
     if (m_ringReady)
     {
         io_uring_queue_exit(&m_ring);
@@ -148,6 +167,12 @@ void UringRpcProvider::Run()
 
     // std::cout << "UringRpcProvider start service at ip:" << ip << " port:" << port << std::endl;
     LOG_INFO("UringRpcProvider start service at ip:%s port:%d", ip.c_str(), port);
+
+    if (!setupBufRing())
+    {
+        LOG_ERROR("setup provided buffer ring failed");
+        exit(EXIT_FAILURE);
+    }
 
     if (!submitAccept())
     {
@@ -222,6 +247,33 @@ void UringRpcProvider::registerServiceToZk(const std::string &ip, uint16_t port)
     }
 }
 
+bool UringRpcProvider::setupBufRing()
+{
+    int err = 0;
+    m_bufRing = io_uring_setup_buf_ring(&m_ring, kBufRingEntries, kBufGroupId, 0, &err);
+    if (m_bufRing == nullptr)
+    {
+        LOG_ERROR("io_uring_setup_buf_ring error:%s", strerror(-err));
+        return false;
+    }
+
+    m_bufBase = malloc(static_cast<size_t>(kBufRingEntries) * kBufSize);
+    if (m_bufBase == nullptr)
+    {
+        return false;
+    }
+
+    // 把全部 buffer 一次性交给内核
+    unsigned mask = io_uring_buf_ring_mask(kBufRingEntries);
+    for (unsigned i = 0; i < kBufRingEntries; ++i)
+    {
+        char *buf = static_cast<char *>(m_bufBase) + static_cast<size_t>(i) * kBufSize;
+        io_uring_buf_ring_add(m_bufRing, buf, kBufSize, i, mask, i);
+    }
+    io_uring_buf_ring_advance(m_bufRing, kBufRingEntries);
+    return true;
+}
+
 void UringRpcProvider::eventLoop()
 {
     while (true)
@@ -248,9 +300,26 @@ void UringRpcProvider::eventLoop()
         {
             __u64 ud = cqe->user_data;
             int result = cqe->res;
+            unsigned cqe_flags = cqe->flags;
             ConnectionContext* ctx = unpackCtx(ud);
             OpType op = unpackOp(ud);
             io_uring_cqe_seen(&m_ring, cqe);
+
+            // RECV 携带内核选中的 provided buffer：无论连接是否正在关闭，
+            // 都必须先把数据拷出、buffer 归还 ring，否则关连接时会泄漏内核缓冲。
+            // 注意：拷贝必须在归还之前，否则内核可能用新数据覆盖该 buffer。
+            if (op == OpType::RECV && (cqe_flags & IORING_CQE_F_BUFFER))
+            {
+                unsigned bid = cqe_flags >> IORING_CQE_BUFFER_SHIFT;
+                char *buf = static_cast<char *>(m_bufBase) + static_cast<size_t>(bid) * kBufSize;
+                if (result > 0 && ctx != nullptr && !ctx->closing)
+                {
+                    ctx->input.append(buf, result);
+                }
+                io_uring_buf_ring_add(m_bufRing, buf, kBufSize, bid,
+                                      io_uring_buf_ring_mask(kBufRingEntries), 0);
+                io_uring_buf_ring_advance(m_bufRing, 1);
+            }
 
             if (m_connMgr.onComplete(ctx))
             {
@@ -301,8 +370,12 @@ bool UringRpcProvider::submitRecv(int fd)
     {
         return false;
     }
-    io_uring_prep_recv(sqe, fd, ctx->buffer, sizeof(ctx->buffer), 0);
-    sqe->user_data = packUserData(ctx, OpType::RECV);
+    // 不再指定缓冲：由内核从 buffer group 选一个 provided buffer 填充，
+    // 完成时通过 cqe->flags 告知 buffer id
+    io_uring_prep_recv(sqe, fd, nullptr, kBufSize, 0);
+    sqe->flags |= IOSQE_BUFFER_SELECT;
+    sqe->buf_group = kBufGroupId;
+    io_uring_sqe_set_data64(sqe, packUserData(ctx, OpType::RECV));
     m_connMgr.onSubmit(ctx);
     return true;
 }
@@ -438,19 +511,34 @@ void UringRpcProvider::handleAccept(int result)
 void UringRpcProvider::handleRecv(ConnectionContext *ctx, int result)
 {
     int fd = ctx->fd;
+
+    // 连接正在关闭（buffer 已在 eventLoop 归还）：不再读/派发新请求，等在途 op 排空回收
+    if (ctx->closing)
+    {
+        return;
+    }
+
     if (result <= 0)
     {
+        if (result == -ENOBUFS)
+        {
+            // buffer ring 暂时取空（非错误）：重挂 recv，缓冲会随处理回填
+            if (!submitRecv(fd))
+            {
+                LOG_ERROR("SQ full on ENOBUFS rearm fd=%d, closing", fd);
+                m_connMgr.close(fd);
+            }
+            return;
+        }
         if (result < 0)
         {
             LOG_ERROR("recv error:%s", strerror(-result));
         }
-        m_connMgr.close(fd);
+        m_connMgr.close(fd);  // 0 = EOF / 其它错误
         return;
     }
 
-
-    ctx->input.append(ctx->buffer, result);
-
+    // 数据已在 eventLoop 中从 provided buffer 拷入 ctx->input
     // 排空缓冲区里所有完整请求（多路复用：一次 recv 可能带回多个流水线请求）
     while (tryHandleRequest(fd, ctx))
     {

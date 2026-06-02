@@ -16,7 +16,6 @@ struct ConnectionContext
     std::deque<std::string> outQueue; // 待发送响应队列（多路复用：同一连接多个响应排队）
     size_t written;                   // 队首响应已发送的字节数
     bool sending;                     // 是否已有一个 send 在途（保证同一连接同时只挂一个 send）
-    char buffer[4096];
 
     int inflight;
     bool closing;

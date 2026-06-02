@@ -7,6 +7,7 @@
 #include <atomic>
 #include <cstdint>
 #include <future>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>

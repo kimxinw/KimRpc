@@ -69,6 +69,7 @@ private:
 
     void startListen(const std::string &ip, uint16_t port);
     void registerServiceToZk(const std::string &ip, uint16_t port);
+    bool setupBufRing();
     void eventLoop();
 
     bool submitAccept();
@@ -96,6 +97,10 @@ private:
     bool m_ringReady;
     bool m_acceptPending;
     bool m_notifyPending;
+
+    // provided buffer ring（所有连接共享的内核可选缓冲池）
+    io_uring_buf_ring *m_bufRing = nullptr;
+    void *m_bufBase = nullptr;
 
     // Worker → main notification
     int m_notifyFd;
