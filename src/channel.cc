@@ -1,5 +1,7 @@
 #include "channel.h"
 
+#include <google/protobuf/stubs/callback.h>
+
 #include "application.h"
 #include "controller.h"
 #include "rpcaddresscache.h"
@@ -51,12 +53,25 @@ void KimRpcChannel::teardown()
 
 void KimRpcChannel::failAllPending(const std::string &reason)
 {
-    std::lock_guard<std::mutex> lock(m_pendingMtx);
-    for (auto &kv : m_pending)
+    // 先把等待表整体摘出，再在锁外触发，避免回调里重入 m_pendingMtx 死锁
+    std::unordered_map<uint64_t, Pending *> pending;
     {
-        kv.second->prom.set_value(false);
+        std::lock_guard<std::mutex> lock(m_pendingMtx);
+        pending.swap(m_pending);
     }
-    m_pending.clear();
+    for (auto &kv : pending)
+    {
+#ifdef KIMRPC_ASYNC_CLIENT
+        if (kv.second->controller != nullptr)
+        {
+            kv.second->controller->SetFailed(reason);
+        }
+        kv.second->done->Run();
+        delete kv.second;
+#else
+        kv.second->prom.set_value(false);
+#endif
+    }
 }
 
 // 收线程专用：只读，失败返回 false，不主动关 fd（关闭由 teardown 统一处理）
@@ -104,15 +119,33 @@ void KimRpcChannel::recvLoop()
             break;
         }
 
-        std::lock_guard<std::mutex> lock(m_pendingMtx);
-        auto it = m_pending.find(id);
-        if (it != m_pending.end())
+        Pending *pend = nullptr;
         {
-            *it->second->response_buf = std::move(body);
-            it->second->prom.set_value(true);
-            m_pending.erase(it);
+            std::lock_guard<std::mutex> lock(m_pendingMtx);
+            auto it = m_pending.find(id);
+            if (it != m_pending.end())
+            {
+                pend = it->second;
+                m_pending.erase(it);
+            }
+            // 未知 id（例如已超时移除）直接丢弃
         }
-        // 未知 id（例如已超时移除）直接丢弃
+        if (pend == nullptr)
+        {
+            continue;
+        }
+#ifdef KIMRPC_ASYNC_CLIENT
+        // 非阻塞：在收线程里直接解析响应并触发回调，调用线程早已返回
+        if (!pend->response->ParseFromArray(body.data(), body.size()) && pend->controller != nullptr)
+        {
+            pend->controller->SetFailed("parse response error!");
+        }
+        pend->done->Run();
+        delete pend;
+#else
+        *pend->response_buf = std::move(body);
+        pend->prom.set_value(true);
+#endif
     }
 
     m_running = false;
@@ -208,6 +241,25 @@ void KimRpcChannel::CallMethod(const google::protobuf::MethodDescriptor *method,
                               google::protobuf::Message *response,
                               google::protobuf::Closure *done)
 {
+#ifdef KIMRPC_ASYNC_CLIENT
+    // 有回调：纯异步，立即返回。无回调：在异步内核上合成一次同步调用
+    if (done != nullptr)
+    {
+        callAsync(method, controller, request, response, done);
+        return;
+    }
+    struct Synchronizer
+    {
+        std::promise<void> prom;
+        void Notify() { prom.set_value(); }
+    } sync;
+    std::future<void> fut = sync.prom.get_future();
+    google::protobuf::Closure *sync_done =
+        google::protobuf::NewCallback(&sync, &Synchronizer::Notify);
+    callAsync(method, controller, request, response, sync_done);
+    fut.wait(); // 阻塞直到收线程（或内联失败路径）触发回调
+    return;
+#else
     const google::protobuf::ServiceDescriptor *sd = method->service();
     std::string service_name = sd->name();
     std::string method_name = method->name();
@@ -320,4 +372,106 @@ void KimRpcChannel::CallMethod(const google::protobuf::MethodDescriptor *method,
     {
         done->Run();
     }
+#endif // KIMRPC_ASYNC_CLIENT
 }
+
+#ifdef KIMRPC_ASYNC_CLIENT
+// 非阻塞内核：注册等待槽后立即返回。请求已在此处同步序列化，故 request 可在返回后释放；
+// response/controller/done 必须由调用方保活至回调触发。回调在收线程执行。
+void KimRpcChannel::callAsync(const google::protobuf::MethodDescriptor *method,
+                             google::protobuf::RpcController *controller,
+                             const google::protobuf::Message *request,
+                             google::protobuf::Message *response,
+                             google::protobuf::Closure *done)
+{
+    // 任一前置失败都要：写 controller（若有）+ 触发一次 done，保证 caller 不会永久挂起
+    auto fail = [&](const std::string &reason) {
+        if (controller != nullptr)
+        {
+            controller->SetFailed(reason);
+        }
+        done->Run();
+    };
+
+    const google::protobuf::ServiceDescriptor *sd = method->service();
+    std::string service_name = sd->name();
+    std::string method_name = method->name();
+
+    std::string args_str;
+    if (!request->SerializeToString(&args_str))
+    {
+        fail("serialize request error!");
+        return;
+    }
+    uint32_t args_size = args_str.size();
+
+    uint64_t request_id = m_nextId.fetch_add(1, std::memory_order_relaxed);
+
+    KimRpc::RpcHeader rpcHeader;
+    rpcHeader.set_service_name(service_name);
+    rpcHeader.set_method_name(method_name);
+    rpcHeader.set_args_size(args_size);
+    rpcHeader.set_request_id(request_id);
+
+    std::string rpc_header_str;
+    if (!rpcHeader.SerializeToString(&rpc_header_str))
+    {
+        fail("serialize rpcHeader error!");
+        return;
+    }
+    uint32_t header_size = rpc_header_str.size();
+
+    std::string send_rpc_str;
+    send_rpc_str.reserve(sizeof(uint32_t) + header_size + args_size);
+    send_rpc_str.append(reinterpret_cast<char *>(&header_size), sizeof(uint32_t));
+    send_rpc_str += rpc_header_str;
+    send_rpc_str += args_str;
+
+    std::string method_path = "/" + service_name + "/" + method_name;
+    std::string host_data;
+    std::string error;
+    if (!GetRpcAddress(method_path, &host_data, &error))
+    {
+        fail(error);
+        return;
+    }
+    if (!ensureConnected(host_data, &error))
+    {
+        fail(error);
+        return;
+    }
+
+    // 注册等待槽（堆分配，所有权随响应转移给收线程）。必须先注册再发送，
+    // 否则响应可能先于登记到达而被当成未知 id 丢弃
+    Pending *pend = new Pending{response, controller, done};
+    {
+        std::lock_guard<std::mutex> lock(m_pendingMtx);
+        m_pending[request_id] = pend;
+    }
+
+    if (!sendLocked(send_rpc_str.c_str(), send_rpc_str.size(), &error))
+    {
+        // 发送失败：尝试撤销等待槽。若收线程已抢先取走则由它负责触发 done
+        bool taken = false;
+        {
+            std::lock_guard<std::mutex> lock(m_pendingMtx);
+            auto it = m_pending.find(request_id);
+            if (it != m_pending.end())
+            {
+                m_pending.erase(it);
+            }
+            else
+            {
+                taken = true;
+            }
+        }
+        if (!taken)
+        {
+            delete pend;
+            fail(error);
+        }
+        return;
+    }
+    // 发送成功：响应到达时由收线程解析并触发 done，本函数立即返回
+}
+#endif // KIMRPC_ASYNC_CLIENT

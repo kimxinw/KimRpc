@@ -1,5 +1,9 @@
 #pragma once
 
+// 非阻塞客户端开关：定义宏让 KimRpcChannel::CallMethod 变为非阻塞（依赖 done 回调，
+// 传 nullptr 时框架内部退化为同步）。取消则为传统阻塞实现。
+// #define KIMRPC_ASYNC_CLIENT
+
 #include <google/protobuf/service.h>
 #include <google/protobuf/descriptor.h>
 #include <google/protobuf/message.h>
@@ -30,12 +34,30 @@ public:
                     google::protobuf::Closure *done) override;
 
 private:
-    // 等待中的一次调用：响应体写入 response_buf，通过 prom 唤醒调用线程
+    // 等待中的一次调用，按编译模式有两种唤醒方式
     struct Pending
     {
+#ifdef KIMRPC_ASYNC_CLIENT
+        // 非阻塞模式：收线程把响应直接解析进 response，再触发 done 回调
+        google::protobuf::Message *response;
+        google::protobuf::RpcController *controller; // 可能为空
+        google::protobuf::Closure *done;             // 完成回调，非空
+#else
+        // 阻塞模式：响应体写入 response_buf，通过 prom 唤醒调用线程
         std::string *response_buf;
         std::promise<bool> prom;
+#endif
     };
+
+#ifdef KIMRPC_ASYNC_CLIENT
+    // 非阻塞内核：注册等待槽后立即返回，响应到达时由收线程触发 done。
+    // 失败（地址/连接/序列化/发送）时也保证恰好触发一次 done。
+    void callAsync(const google::protobuf::MethodDescriptor *method,
+                   google::protobuf::RpcController *controller,
+                   const google::protobuf::Message *request,
+                   google::protobuf::Message *response,
+                   google::protobuf::Closure *done);
+#endif
 
     bool ensureConnected(const std::string &host_data, std::string *error);
     bool sendLocked(const char *data, size_t len, std::string *error);
