@@ -168,18 +168,18 @@ static ::PROTOBUF_NAMESPACE_ID::Message const * const file_default_instances[] =
 };
 
 const char descriptor_table_protodef_user_2eproto[] PROTOBUF_SECTION_VARIABLE(protodesc_cold) =
-  "\n\nuser.proto\022\006KimRpc\"-\n\nResultCode\022\017\n\007err"
-  "code\030\001 \001(\005\022\016\n\006errmsg\030\002 \001(\014\")\n\014LoginReque"
-  "st\022\014\n\004name\030\001 \001(\014\022\013\n\003pwd\030\002 \001(\014\"C\n\rLoginRe"
-  "sponse\022!\n\006result\030\001 \001(\0132\021.KimRpc.ResultCod"
-  "e\022\017\n\007success\030\002 \001(\010\"8\n\017RegisterRequest\022\n\n"
-  "\002id\030\001 \001(\r\022\014\n\004name\030\002 \001(\014\022\013\n\003pwd\030\003 \001(\014\"F\n\020"
-  "RegisterResponse\022!\n\006result\030\001 \001(\0132\021.KimRpc"
-  ".ResultCode\022\017\n\007success\030\002 \001(\0102\201\001\n\016UserSer"
-  "viceRpc\0222\n\005Login\022\023.KimRpc.LoginRequest\032\024."
-  "KimRpc.LoginResponse\022;\n\010Register\022\026.KimRpc."
-  "RegisterRequest\032\027.KimRpc.RegisterResponse"
-  "B\003\200\001\001b\006proto3"
+  "\n\nuser.proto\022\006KimRpc\"-\n\nResultCode\022\017\n\007er"
+  "rcode\030\001 \001(\005\022\016\n\006errmsg\030\002 \001(\014\")\n\014LoginRequ"
+  "est\022\014\n\004name\030\001 \001(\014\022\013\n\003pwd\030\002 \001(\014\"D\n\rLoginR"
+  "esponse\022\"\n\006result\030\001 \001(\0132\022.KimRpc.ResultC"
+  "ode\022\017\n\007success\030\002 \001(\010\"8\n\017RegisterRequest\022"
+  "\n\n\002id\030\001 \001(\r\022\014\n\004name\030\002 \001(\014\022\013\n\003pwd\030\003 \001(\014\"G"
+  "\n\020RegisterResponse\022\"\n\006result\030\001 \001(\0132\022.Kim"
+  "Rpc.ResultCode\022\017\n\007success\030\002 \001(\0102\205\001\n\016User"
+  "ServiceRpc\0224\n\005Login\022\024.KimRpc.LoginReques"
+  "t\032\025.KimRpc.LoginResponse\022=\n\010Register\022\027.K"
+  "imRpc.RegisterRequest\032\030.KimRpc.RegisterR"
+  "esponseB\003\200\001\001b\006proto3"
   ;
 static const ::PROTOBUF_NAMESPACE_ID::internal::DescriptorTable*const descriptor_table_user_2eproto_deps[1] = {
 };
@@ -192,7 +192,7 @@ static ::PROTOBUF_NAMESPACE_ID::internal::SCCInfoBase*const descriptor_table_use
 };
 static ::PROTOBUF_NAMESPACE_ID::internal::once_flag descriptor_table_user_2eproto_once;
 const ::PROTOBUF_NAMESPACE_ID::internal::DescriptorTable descriptor_table_user_2eproto = {
-  false, false, descriptor_table_protodef_user_2eproto, "user.proto", 453,
+  false, false, descriptor_table_protodef_user_2eproto, "user.proto", 460,
   &descriptor_table_user_2eproto_once, descriptor_table_user_2eproto_sccs, descriptor_table_user_2eproto_deps, 5, 0,
   schemas, file_default_instances, TableStruct_user_2eproto::offsets,
   file_level_metadata_user_2eproto, 5, file_level_enum_descriptors_user_2eproto, file_level_service_descriptors_user_2eproto,

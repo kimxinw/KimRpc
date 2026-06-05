@@ -58,10 +58,10 @@ static ::PROTOBUF_NAMESPACE_ID::Message const * const file_default_instances[] =
 };
 
 const char descriptor_table_protodef_rpcheader_2eproto[] PROTOBUF_SECTION_VARIABLE(protodesc_cold) =
-  "\n\017rpcheader.proto\022\006KimRpc\"]\n\tRpcHeader\022\024\n"
-  "\014service_name\030\001 \001(\014\022\023\n\013method_name\030\002 \001(\014"
-  "\022\021\n\targs_size\030\003 \001(\r\022\022\n\nrequest_id\030\004 \001(\004B"
-  "\003\200\001\001b\006proto3"
+  "\n\017rpcheader.proto\022\006KimRpc\"]\n\tRpcHeader\022\024"
+  "\n\014service_name\030\001 \001(\014\022\023\n\013method_name\030\002 \001("
+  "\014\022\021\n\targs_size\030\003 \001(\r\022\022\n\nrequest_id\030\004 \001(\004"
+  "B\003\200\001\001b\006proto3"
   ;
 static const ::PROTOBUF_NAMESPACE_ID::internal::DescriptorTable*const descriptor_table_rpcheader_2eproto_deps[1] = {
 };
@@ -70,7 +70,7 @@ static ::PROTOBUF_NAMESPACE_ID::internal::SCCInfoBase*const descriptor_table_rpc
 };
 static ::PROTOBUF_NAMESPACE_ID::internal::once_flag descriptor_table_rpcheader_2eproto_once;
 const ::PROTOBUF_NAMESPACE_ID::internal::DescriptorTable descriptor_table_rpcheader_2eproto = {
-  false, false, descriptor_table_protodef_rpcheader_2eproto, "rpcheader.proto", 132,
+  false, false, descriptor_table_protodef_rpcheader_2eproto, "rpcheader.proto", 133,
   &descriptor_table_rpcheader_2eproto_once, descriptor_table_rpcheader_2eproto_sccs, descriptor_table_rpcheader_2eproto_deps, 1, 0,
   schemas, file_default_instances, TableStruct_rpcheader_2eproto::offsets,
   file_level_metadata_rpcheader_2eproto, 1, file_level_enum_descriptors_rpcheader_2eproto, file_level_service_descriptors_rpcheader_2eproto,

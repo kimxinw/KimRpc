@@ -111,14 +111,14 @@ static ::PROTOBUF_NAMESPACE_ID::Message const * const file_default_instances[] =
 };
 
 const char descriptor_table_protodef_friend_2eproto[] PROTOBUF_SECTION_VARIABLE(protodesc_cold) =
-  "\n\014friend.proto\022\006KimRpc\"-\n\nResultCode\022\017\n\007e"
-  "rrcode\030\001 \001(\005\022\016\n\006errmsg\030\002 \001(\014\"&\n\024GetFrien"
-  "dListRequest\022\016\n\006userid\030\001 \001(\r\"K\n\025GetFrien"
-  "dListResponse\022!\n\006result\030\001 \001(\0132\021.KimRpc.Re"
-  "sultCode\022\017\n\007friends\030\002 \003(\0142^\n\020FriendServi"
-  "ceRpc\022J\n\rGetFriendList\022\033.KimRpc.GetFriend"
-  "ListRequest\032\034.KimRpc.GetFriendListRespons"
-  "eB\003\200\001\001b\006proto3"
+  "\n\014friend.proto\022\006KimRpc\"-\n\nResultCode\022\017\n\007"
+  "errcode\030\001 \001(\005\022\016\n\006errmsg\030\002 \001(\014\"&\n\024GetFrie"
+  "ndListRequest\022\016\n\006userid\030\001 \001(\r\"L\n\025GetFrie"
+  "ndListResponse\022\"\n\006result\030\001 \001(\0132\022.KimRpc."
+  "ResultCode\022\017\n\007friends\030\002 \003(\0142`\n\020FriendSer"
+  "viceRpc\022L\n\rGetFriendList\022\034.KimRpc.GetFri"
+  "endListRequest\032\035.KimRpc.GetFriendListRes"
+  "ponseB\003\200\001\001b\006proto3"
   ;
 static const ::PROTOBUF_NAMESPACE_ID::internal::DescriptorTable*const descriptor_table_friend_2eproto_deps[1] = {
 };
@@ -129,7 +129,7 @@ static ::PROTOBUF_NAMESPACE_ID::internal::SCCInfoBase*const descriptor_table_fri
 };
 static ::PROTOBUF_NAMESPACE_ID::internal::once_flag descriptor_table_friend_2eproto_once;
 const ::PROTOBUF_NAMESPACE_ID::internal::DescriptorTable descriptor_table_friend_2eproto = {
-  false, false, descriptor_table_protodef_friend_2eproto, "friend.proto", 294,
+  false, false, descriptor_table_protodef_friend_2eproto, "friend.proto", 298,
   &descriptor_table_friend_2eproto_once, descriptor_table_friend_2eproto_sccs, descriptor_table_friend_2eproto_deps, 3, 0,
   schemas, file_default_instances, TableStruct_friend_2eproto::offsets,
   file_level_metadata_friend_2eproto, 3, file_level_enum_descriptors_friend_2eproto, file_level_service_descriptors_friend_2eproto,
