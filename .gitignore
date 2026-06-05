@@ -19,4 +19,6 @@ example/benchmark/muduoprovider*.txt
 example/benchmark/uringprovider*.txt
 bin/*-log.txt
 
+.clangd
+compile_commands.json
 
