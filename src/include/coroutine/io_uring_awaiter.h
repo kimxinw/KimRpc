@@ -102,6 +102,10 @@ struct UringAwaiter
 
     // 实际提交时机：交给事件循环的 io_uring_submit_and_wait 批量 flush，
     // 这里不单独 submit，以便多个 co_await 的 SQE 合批。
+    //
+    // 返回平凡的 int（cqe->res），故不触发 GCC 11 协程 codegen bug。若要自定义
+    // awaiter 从 await_resume 返回非平凡对象（如 std::string），在 GCC 11 下会
+    // 砸坏堆——详见 task.h 顶部“GCC 11 协程 codegen bug”说明。
     int await_resume() const noexcept { return req.result; }
 
     // 取回 CQE flags（例如 provided buffer 的 buffer id），需要时单独读

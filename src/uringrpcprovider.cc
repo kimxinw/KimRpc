@@ -4,6 +4,9 @@
 #include "application.h"
 #include "rpcheader.pb.h"
 #include "zookeeperutil.h"
+#include "coroutine/io_uring_awaiter.h"
+
+#include <google/protobuf/stubs/callback.h>
 
 #include <arpa/inet.h>
 #include <cerrno>
@@ -301,9 +304,19 @@ void UringRpcProvider::eventLoop()
             __u64 ud = cqe->user_data;
             int result = cqe->res;
             unsigned cqe_flags = cqe->flags;
+            io_uring_cqe_seen(&m_ring, cqe);
+
+            // 协程完成（io_uring awaiter，bit63 标记）：直接唤醒对应协程。
+            // 当前 RPC 分发不走这条路（靠 eventfd 恢复），但保留它，业务后续若在
+            // 共享 ring 上 co_await async_recv/send 等即可直接复用。
+            if (kimrpc::coro::isCoroUserData(ud))
+            {
+                kimrpc::coro::resumeFromCqe(ud, result, cqe_flags);
+                continue;
+            }
+
             ConnectionContext* ctx = unpackCtx(ud);
             OpType op = unpackOp(ud);
-            io_uring_cqe_seen(&m_ring, cqe);
 
             // RECV 携带内核选中的 provided buffer：无论连接是否正在关闭，
             // 都必须先把数据拷出、buffer 归还 ring，否则关连接时会泄漏内核缓冲。
@@ -423,30 +436,49 @@ bool UringRpcProvider::submitNotifyRead()
 
 void UringRpcProvider::handleNotify()
 {
-    std::vector<PendingResponse> responses;
+    // worker 线程完成 CallMethod 后把协程句柄投到这里，统一在 reactor 线程恢复。
+    // 恢复后协程会走到 co_await 之后，把成帧响应交给 deliverResponse 发送。
+    std::vector<std::coroutine_handle<>> ready;
     {
-        std::lock_guard<std::mutex> lock(m_pendingMutex);
-        responses.swap(m_pendingResponses);
+        std::lock_guard<std::mutex> lock(m_readyMutex);
+        ready.swap(m_readyCoros);
     }
-    for (auto &r : responses)
+    for (auto h : ready)
     {
-        ConnectionContext * ctx = m_connMgr.find(r.fd);
-        // fd 已被新连接复用：connId 对不上，丢弃这条属于旧连接的响应
-        if (ctx == nullptr || ctx->connId != r.connId)
+        h.resume();
+    }
+}
+
+// reactor 线程：connId 校验后把成帧响应推入发送队列，必要时启动发送链。
+// 与原 handleNotify 的投递逻辑一致，复用现有的串行发送 + 背压机制。
+void UringRpcProvider::deliverResponse(int fd, uint64_t connId, std::string data)
+{
+    ConnectionContext *ctx = m_connMgr.find(fd);
+    // fd 已被新连接复用：connId 对不上，丢弃这条属于旧连接的响应
+    if (ctx == nullptr || ctx->connId != connId)
+    {
+        return;
+    }
+    ctx->outQueue.push_back(std::move(data));
+    // 已有 send 在途时，后续响应由 handleSend 链式取走；否则在此启动
+    if (!ctx->sending)
+    {
+        if (!submitSend(fd))
         {
-            continue;
-        }
-        ctx->outQueue.push_back(std::move(r.data));
-        // 已有 send 在途时，后续响应由 handleSend 链式取走；否则在此启动
-        if (!ctx->sending)
-        {
-            if (!submitSend(r.fd))
-            {
-                LOG_ERROR("SQ full, cannot send response on fd=%d, closing", r.fd);
-                m_connMgr.close(r.fd);
-            }
+            LOG_ERROR("SQ full, cannot send response on fd=%d, closing", fd);
+            m_connMgr.close(fd);
         }
     }
+}
+
+void UringRpcProvider::resumeOnReactor(std::coroutine_handle<> h)
+{
+    {
+        std::lock_guard<std::mutex> lock(m_readyMutex);
+        m_readyCoros.push_back(h);
+    }
+    uint64_t val = 1;
+    ::write(m_notifyFd, &val, sizeof(val));
 }
 
 void UringRpcProvider::workerThread()
@@ -704,55 +736,80 @@ bool UringRpcProvider::tryHandleRequest(int fd, ConnectionContext *ctx)
         m_connMgr.close(fd);
         return true;
     }
-    google::protobuf::Message *response = service->GetResponsePrototype(method).New();
-
-    ResponseTag *tag = new ResponseTag{fd, request_id, ctx->connId};
-    google::protobuf::Closure *done = google::protobuf::NewCallback<UringRpcProvider,
-                                                                     ResponseTag *,
-                                                                     google::protobuf::Message *>(this,
-                                                                                                  &UringRpcProvider::sendRpcResponse,
-                                                                                                  tag,
-                                                                                                  response);
 
     ++ctx->pendingReqs;  // 派发即计入在途，响应发完后在 handleSend 里递减
-    submitTask([service, method, request, response, done]() {
-        service->CallMethod(method, nullptr, request, response, done);
-        delete request;
-    });
+    // 每个请求起一个协程：DetachedTask 即发即忘，运行到 co_await（offload 到线程池）
+    // 即让出 reactor 线程；response 在协程内创建，request 所有权转交协程。
+    handleRpc(fd, ctx->connId, request_id, service, method, request);
     return true;
 }
 
-// 业务线程唤起
-void UringRpcProvider::sendRpcResponse(ResponseTag *tag, google::protobuf::Message *response)
+// 每个请求的协程主体（在 reactor 线程启动）
+kimrpc::coro::DetachedTask UringRpcProvider::handleRpc(
+    int fd, uint64_t connId, uint64_t request_id,
+    google::protobuf::Service *service,
+    const google::protobuf::MethodDescriptor *method,
+    google::protobuf::Message *request)
 {
-    int fd = tag->fd;
-    uint64_t connId = tag->connId;
-    uint64_t request_id = tag->request_id;
-    delete tag;
+    google::protobuf::Message *response = service->GetResponsePrototype(method).New();
 
+    // frame 是协程局部：onPoolDone 在 worker 线程经 &frame 写入成帧响应；不从
+    // await_resume 按值返回 std::string（规避 GCC 11 协程 codegen bug，详见 awaiter 注释）。
+    std::string frame;
+    co_await CallOnPoolAwaiter{this, service, method, request, response, request_id, &frame};
+
+    // 已回到 reactor 线程：交给现有发送机制（connId 校验 + 串行发送 + 背压）
+    if (!frame.empty())
+    {
+        deliverResponse(fd, connId, std::move(frame));
+    }
+    co_return;
+}
+
+// awaiter：把 CallMethod 提交到线程池执行。done 回调绑定 awaiter 与协程句柄，
+// 业务执行完毕调用 done->Run() 时触发 onPoolDone（在 worker 线程）。
+void UringRpcProvider::CallOnPoolAwaiter::await_suspend(std::coroutine_handle<> h)
+{
+    google::protobuf::Closure *done =
+        google::protobuf::NewCallback(self, &UringRpcProvider::onPoolDone, this, h);
+
+    // 全部按值捕获，task 内不再触碰 awaiter：协程一旦恢复完成，awaiter 即随帧销毁
+    google::protobuf::Service *svc = service;
+    const google::protobuf::MethodDescriptor *m = method;
+    google::protobuf::Message *req = request;
+    google::protobuf::Message *resp = response;
+    self->submitTask([svc, m, req, resp, done]() {
+        svc->CallMethod(m, nullptr, req, resp, done);
+        delete req;  // request 仅在 CallMethod 期间使用，返回后即可释放
+    });
+}
+
+// 业务 done 回调（worker 线程）：序列化响应写入 *aw->out（协程局部 frame），释放
+// response，再把协程句柄投回 reactor 线程恢复。序列化放在 worker 线程，避免 reactor
+// 与 worker 跨线程读 response 的数据竞争。
+void UringRpcProvider::onPoolDone(CallOnPoolAwaiter *aw, std::coroutine_handle<> h)
+{
     std::string response_str;
-    if (response->SerializeToString(&response_str))
+    if (aw->response->SerializeToString(&response_str))
     {
         // wire: [4字节 size][8字节 request_id][body], size = 8 + body
         uint32_t response_size = sizeof(uint64_t) + response_str.size();
-        std::string data;
-        data.reserve(sizeof(uint32_t) + response_size);
-        data.append(reinterpret_cast<char *>(&response_size), sizeof(uint32_t));
-        data.append(reinterpret_cast<char *>(&request_id), sizeof(uint64_t));
-        data += response_str;
-
-        {
-            std::lock_guard<std::mutex> lock(m_pendingMutex);
-            m_pendingResponses.push_back({fd, connId, std::move(data)});
-        }
-        uint64_t val = 1;
-        ::write(m_notifyFd, &val, sizeof(val));
+        std::string &frame = *aw->out; // 写协程局部变量
+        frame.reserve(sizeof(uint32_t) + response_size);
+        frame.append(reinterpret_cast<char *>(&response_size), sizeof(uint32_t));
+        frame.append(reinterpret_cast<char *>(&aw->request_id), sizeof(uint64_t));
+        frame += response_str;
     }
     else
     {
         LOG_ERROR("serialize response_str error");
+        // frame 留空：handleRpc 恢复后跳过发送（响应丢失，连接保持）
     }
-    delete response;
+    delete aw->response;
+
+    // frame 写入 happens-before resumeOnReactor 里的入队，与 reactor 线程取队
+    // 构成同步：协程恢复后能安全看到 frame。此后不再触碰 aw。
+    resumeOnReactor(h);
 }
 
 

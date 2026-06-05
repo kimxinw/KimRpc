@@ -13,6 +13,29 @@
 //
 // 如果需要一个“根协程”（没有父协程来 co_await、即发即忘，例如“处理一条连接的
 // 一个请求”），用 DetachedTask（见文件末尾）。
+//
+// ⚠️ GCC 11 协程 codegen bug（重要）
+// ───────────────────────────────────────────────────────────────────────────
+// GCC 11.x（含 11.4）在“从 await_resume() 按值返回一个非平凡类型（如
+// std::string）去初始化协程局部变量”时会生成错误代码：
+//
+//     std::string s = co_await some_awaiter;   // some_awaiter.await_resume() 返回 std::string
+//
+// 该局部 s 的内部数据指针会被错误地指向协程帧内存，协程结束析构 s 时 free 一个指向
+// 协程帧的指针 → bad-free / 堆损坏（用 AddressSanitizer 可见 “attempting free on
+// address which was not malloc()-ed … inside … region allocated by <coroutine>”）。
+// 现象往往很隐蔽：先踩坏堆，过一会儿别处的对象才表现出数据损坏。
+//
+// 规避（本仓库采用）：让 await_resume() 返回 void 或平凡类型（int/指针），需要带回的
+// 非平凡结果改用“协程局部变量 + awaiter 持其指针、生产方经指针写入”的方式传递：
+//
+//     std::string out;                              // 协程局部
+//     co_await SomeAwaiter{ ..., &out };            // awaiter 持 &out，await_resume 返回 void
+//     use(out);                                     // 回来后直接用局部
+//
+// 返回引用（如本文件 Task<T> 的 await_resume 返回 T&）不受影响；该 bug 仅针对“按值
+// 返回非平凡对象”。GCC 12+ 已修复，升级编译器后按值返回亦安全。
+// 参考 UringRpcProvider::CallOnPoolAwaiter 的用法。
 
 #include <coroutine>
 #include <cstdio>
