@@ -16,14 +16,38 @@
 #include <unistd.h>
 
 #include <string>
+#include <vector>
+
+namespace
+{
+constexpr int kDefaultTimeoutMs = 5000; // 默认每次调用超时 5s（<=0 表示不超时）
+constexpr int kTimerTickMs = 50;        // 定时器扫描在途请求的周期
+}
 
 KimRpcChannel::KimRpcChannel()
     : m_clientfd(-1), m_running(false), m_nextId(1)
 {
+#ifdef KIMRPC_ASYNC_CLIENT
+    m_timeoutMs.store(kDefaultTimeoutMs, std::memory_order_relaxed);
+    m_timerRunning = true;
+    m_timerThread = std::thread(&KimRpcChannel::timerLoop, this);
+#endif
 }
 
 KimRpcChannel::~KimRpcChannel()
 {
+#ifdef KIMRPC_ASYNC_CLIENT
+    // 先停定时器线程，再 teardown（teardown 里 failAllPending 收尾剩余等待槽）
+    {
+        std::lock_guard<std::mutex> lock(m_pendingMtx);
+        m_timerRunning = false;
+    }
+    m_timerCv.notify_all();
+    if (m_timerThread.joinable())
+    {
+        m_timerThread.join();
+    }
+#endif
     teardown();
 }
 
@@ -441,9 +465,13 @@ void KimRpcChannel::callAsync(const google::protobuf::MethodDescriptor *method,
         return;
     }
 
-    // 注册等待槽（堆分配，所有权随响应转移给收线程）。必须先注册再发送，
+    // 注册等待槽（堆分配，所有权随响应转移给收线程或定时器）。必须先注册再发送，
     // 否则响应可能先于登记到达而被当成未知 id 丢弃
-    Pending *pend = new Pending{response, controller, done};
+    int timeout = m_timeoutMs.load(std::memory_order_relaxed);
+    auto deadline = (timeout > 0)
+                        ? std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout)
+                        : std::chrono::steady_clock::time_point::max();
+    Pending *pend = new Pending{response, controller, done, deadline};
     {
         std::lock_guard<std::mutex> lock(m_pendingMtx);
         m_pending[request_id] = pend;
@@ -473,5 +501,54 @@ void KimRpcChannel::callAsync(const google::protobuf::MethodDescriptor *method,
         return;
     }
     // 发送成功：响应到达时由收线程解析并触发 done，本函数立即返回
+}
+
+// 定时器线程：每 tick 扫描在途请求，把已过期的“抢占”出来并失败掉。
+// 在锁内 erase 拿走所有权，与收线程（recvLoop）互斥，保证同一请求只被一方处理，
+// 不会双触发 done / 双 delete。触发回调放到锁外，避免 done 内重入 m_pendingMtx 死锁。
+void KimRpcChannel::timerLoop()
+{
+    std::unique_lock<std::mutex> lock(m_pendingMtx);
+    while (m_timerRunning)
+    {
+        // 睡一个 tick；析构置位 m_timerRunning 后 notify 可立即唤醒退出
+        m_timerCv.wait_for(lock, std::chrono::milliseconds(kTimerTickMs),
+                           [this] { return !m_timerRunning; });
+        if (!m_timerRunning)
+        {
+            break;
+        }
+
+        auto now = std::chrono::steady_clock::now();
+        std::vector<Pending *> expired;
+        for (auto it = m_pending.begin(); it != m_pending.end();)
+        {
+            if (it->second->deadline <= now)
+            {
+                expired.push_back(it->second);
+                it = m_pending.erase(it);
+            }
+            else
+            {
+                ++it;
+            }
+        }
+        if (expired.empty())
+        {
+            continue; // 仍持锁，进入下一轮 wait
+        }
+
+        lock.unlock();
+        for (auto *p : expired)
+        {
+            if (p->controller != nullptr)
+            {
+                p->controller->SetFailed("rpc timeout");
+            }
+            p->done->Run();
+            delete p;
+        }
+        lock.lock();
+    }
 }
 #endif // KIMRPC_ASYNC_CLIENT

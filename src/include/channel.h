@@ -2,13 +2,15 @@
 
 // 非阻塞客户端开关：定义宏让 KimRpcChannel::CallMethod 变为非阻塞（依赖 done 回调，
 // 传 nullptr 时框架内部退化为同步）。取消则为传统阻塞实现。
-// #define KIMRPC_ASYNC_CLIENT
+#define KIMRPC_ASYNC_CLIENT
 
 #include <google/protobuf/service.h>
 #include <google/protobuf/descriptor.h>
 #include <google/protobuf/message.h>
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <future>
 #include <memory>
@@ -33,6 +35,11 @@ public:
                     google::protobuf::Message *response,
                     google::protobuf::Closure *done) override;
 
+#ifdef KIMRPC_ASYNC_CLIENT
+    // 设置每次调用的超时（毫秒）；<=0 表示不超时。默认 kDefaultTimeoutMs。
+    void SetTimeoutMs(int ms) { m_timeoutMs.store(ms, std::memory_order_relaxed); }
+#endif
+
 private:
     // 等待中的一次调用，按编译模式有两种唤醒方式
     struct Pending
@@ -42,6 +49,7 @@ private:
         google::protobuf::Message *response;
         google::protobuf::RpcController *controller; // 可能为空
         google::protobuf::Closure *done;             // 完成回调，非空
+        std::chrono::steady_clock::time_point deadline; // 超时点；max() 表示不超时
 #else
         // 阻塞模式：响应体写入 response_buf，通过 prom 唤醒调用线程
         std::string *response_buf;
@@ -66,6 +74,10 @@ private:
     void teardown();                  // 关闭连接、join 收线程、唤醒所有等待者
     void failAllPending(const std::string &reason);
 
+#ifdef KIMRPC_ASYNC_CLIENT
+    void timerLoop(); // 周期扫描在途请求，把超时的失败掉（SetFailed + done）
+#endif
+
     // 连接状态：由 m_connMtx 保护
     std::mutex m_connMtx;
     int m_clientfd;
@@ -80,4 +92,11 @@ private:
     std::unordered_map<uint64_t, Pending *> m_pending;
     std::atomic<uint64_t> m_nextId;
 
+#ifdef KIMRPC_ASYNC_CLIENT
+    // 超时管理：定时器线程周期 tick 扫描 m_pending，失败掉过期请求
+    std::atomic<int> m_timeoutMs;      // 调用超时（毫秒），<=0 不超时
+    std::thread m_timerThread;
+    std::condition_variable m_timerCv; // 配合 m_pendingMtx，用于及时停止
+    bool m_timerRunning;               // 由 m_pendingMtx 保护
+#endif
 };
