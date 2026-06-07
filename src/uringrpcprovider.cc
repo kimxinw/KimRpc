@@ -3,7 +3,7 @@
 #include "logger.h"
 #include "application.h"
 #include "rpcheader.pb.h"
-#include "zookeeperutil.h"
+#include "etcdclient.h"
 #include "coroutine/io_uring_awaiter.h"
 
 #include <google/protobuf/stubs/callback.h>
@@ -166,7 +166,7 @@ void UringRpcProvider::Run()
     uint16_t port = stoi(KimRpcApplication::GetInstance().GetConfig().load("rpcserverport"));
 
     startListen(ip, port);
-    registerServiceToZk(ip, port);
+    registerServiceToEtcd(ip, port);
 
     // std::cout << "UringRpcProvider start service at ip:" << ip << " port:" << port << std::endl;
     LOG_INFO("UringRpcProvider start service at ip:%s port:%d", ip.c_str(), port);
@@ -229,25 +229,41 @@ void UringRpcProvider::startListen(const std::string &ip, uint16_t port)
     }
 }
 
-void UringRpcProvider::registerServiceToZk(const std::string &ip, uint16_t port)
+void UringRpcProvider::registerServiceToEtcd(const std::string &ip, uint16_t port)
 {
-    // ZkClient zkCli;
-    // zkCli.Start();
-    m_zkClient.Start(); 
+    constexpr int kLeaseTtl = 10; // 租约 TTL（秒），keepalive 每 ttl/3 续租
+
+    if (!m_etcdClient.Start())
+    {
+        LOG_ERROR("etcd start failed, service register aborted");
+        exit(EXIT_FAILURE);
+    }
+    int64_t lease = m_etcdClient.LeaseGrant(kLeaseTtl);
+    if (lease <= 0)
+    {
+        LOG_ERROR("etcd lease grant failed");
+        exit(EXIT_FAILURE);
+    }
+
+    char addr[64] = {0};
+    snprintf(addr, sizeof(addr), "%s:%d", ip.c_str(), port);
 
     for (auto &sp : m_serviceMap)
     {
-        std::string service_path = "/" + sp.first;
-        m_zkClient.Create(service_path.c_str(), nullptr, 0);
-
         for (auto &mp : sp.second.m_methodMap)
         {
-            std::string method_path = service_path + "/" + mp.first;
-            char method_path_data[128] = {0};
-            snprintf(method_path_data, sizeof(method_path_data), "%s:%d", ip.c_str(), port);
-            m_zkClient.Create(method_path.c_str(), method_path_data, strlen(method_path_data), ZOO_EPHEMERAL);
+            // 实例 key：/<service>/<method>/<ip:port>，value 同为 ip:port，绑定 lease
+            std::string key = "/" + sp.first + "/" + mp.first + "/" + addr;
+            if (!m_etcdClient.Put(key, addr, lease))
+            {
+                LOG_ERROR("etcd put failed: %s", key.c_str());
+                exit(EXIT_FAILURE);
+            }
         }
     }
+
+    // 后台续租：进程存活则所有实例 key 存活；进程退出 lease 过期、key 自动消失
+    m_etcdClient.StartKeepAlive(lease, kLeaseTtl);
 }
 
 bool UringRpcProvider::setupBufRing()

@@ -2,8 +2,10 @@
 #include "application.h"
 #include "rpcheader.pb.h"
 #include "logger.h"
-#include "zookeeperutil.h"
+#include "etcdclient.h"
 
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 void RpcProvider::NotifyService(google::protobuf::Service *service)
@@ -50,25 +52,36 @@ void RpcProvider::Run()
     // 设置muduo的线程数量
     server.setThreadNum(4);
 
-    // 把当前rpc节点上要发布的服务全部注册到zk上面，让rpc cllient可以从zk上发现服务
-    ZkClient zkCli;
-    zkCli.Start(); // 连接zkserver
-    // servive_name为永久性节点， method_name为临时性节点
+    // 把当前rpc节点上要发布的服务全部注册到 etcd，让 client 可以发现并做负载均衡。
+    // 每个 method 一个实例 key：/<service>/<method>/<ip:port>，绑定一个带 TTL 的 lease，
+    // 后台 keepalive 续租；进程退出 lease 过期、所有实例 key 自动消失。
+    constexpr int kLeaseTtl = 10;
+    if (!m_etcdClient.Start())
+    {
+        LOG_ERROR("etcd start failed, service register aborted");
+        exit(EXIT_FAILURE);
+    }
+    int64_t lease = m_etcdClient.LeaseGrant(kLeaseTtl);
+    if (lease <= 0)
+    {
+        LOG_ERROR("etcd lease grant failed");
+        exit(EXIT_FAILURE);
+    }
+    char addr[64] = {0};
+    snprintf(addr, sizeof(addr), "%s:%d", ip.c_str(), port);
     for (auto &sp : m_serviceMap)
     {
-        // service_name
-        std::string service_path = "/" + sp.first;
-        zkCli.Create(service_path.c_str(), nullptr, 0);
         for (auto &mp : sp.second.m_methodMap)
         {
-            // service_name/method_name
-            std::string method_path = service_path + "/" + mp.first;
-            char method_path_data[128] = {0};
-            sprintf(method_path_data, "%s:%d", ip.c_str(), port);
-            //ZOO_EPHEMERAL表示znode是一个临时性节点
-            zkCli.Create(method_path.c_str(), method_path_data, strlen(method_path_data), ZOO_EPHEMERAL);
+            std::string key = "/" + sp.first + "/" + mp.first + "/" + addr;
+            if (!m_etcdClient.Put(key, addr, lease))
+            {
+                LOG_ERROR("etcd put failed: %s", key.c_str());
+                exit(EXIT_FAILURE);
+            }
         }
     }
+    m_etcdClient.StartKeepAlive(lease, kLeaseTtl);
 
     // std::cout << "Rpcprovide start service at ip:" << ip << " port:" << port << std::endl;
     LOG_INFO("Rpcprovide start service at ip:%s port:%d", ip.c_str(), port);

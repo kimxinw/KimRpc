@@ -9,7 +9,6 @@
 #include <numeric>
 #include <algorithm>
 #include <chrono>
-#include <zookeeper/zookeeper.h>
 
 #include "application.h"
 #include "channel.h"
@@ -96,7 +95,6 @@ int main(int argc, char **argv)
 
     int KimRpc_argc = (int)KimRpc_argv.size();
     KimRpcApplication::Init(KimRpc_argc, KimRpc_argv.data());
-    zoo_set_debug_level(ZOO_LOG_LEVEL_ERROR);
 
     const int total = threads * n_per_thr;
 

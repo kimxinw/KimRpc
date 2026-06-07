@@ -1,5 +1,6 @@
 #pragma once
 #include "google/protobuf/service.h"
+#include "etcdclient.h"
 
 #include <unordered_map>
 #include <string>
@@ -31,6 +32,9 @@ private:
     };
     // 存储注册成功的服务对象和其服务方法的所有信息
     std::unordered_map<std::string, ServiceInfo> m_serviceMap;
+
+    // etcd 服务注册客户端（持有 lease + 后台 keepalive，需随 provider 存活）
+    EtcdClient m_etcdClient;
 
     // 随 done 回调传给业务侧，回包时用来定位连接并回填 request_id
     struct ResponseTag

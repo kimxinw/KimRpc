@@ -3,7 +3,7 @@
 #include <google/protobuf/service.h>
 #include <google/protobuf/descriptor.h>
 #include <liburing.h>
-#include "zookeeperutil.h"
+#include "etcdclient.h"
 
 #include"connectionmanager.h"
 #include "coroutine/task.h"
@@ -76,7 +76,7 @@ private:
     };
 
     void startListen(const std::string &ip, uint16_t port);
-    void registerServiceToZk(const std::string &ip, uint16_t port);
+    void registerServiceToEtcd(const std::string &ip, uint16_t port);
     bool setupBufRing();
     void eventLoop();
 
@@ -136,7 +136,7 @@ private:
 
     std::unordered_map<std::string, ServiceInfo> m_serviceMap;
     
-    ZkClient m_zkClient;
+    EtcdClient m_etcdClient;
 
     static __u64 packUserData(ConnectionContext* ctx, OpType op);
     static ConnectionContext* unpackCtx(__u64 ud);
